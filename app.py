@@ -1,6 +1,10 @@
 from flask import Flask, jsonify, request, render_template_string
 import subprocess
 import re
+import os
+import time
+import secrets
+
 
 app = Flask(__name__)
 
@@ -8,6 +12,14 @@ VM1_IP = "172.31.18.202"
 VM2_IP = "172.31.25.34"
 
 demo_failure = False
+# Live monitoring configuration
+HEARTBEAT_TOKEN = os.environ.get("HEARTBEAT_TOKEN", "")
+latest_status = {
+    "connected": False,
+    "latency": 0,
+    "packet_loss": 100
+}
+last_heartbeat = 0
 
 HTML = """
 <!DOCTYPE html>
@@ -400,59 +412,74 @@ setInterval(update,2000);
 def home():
     return render_template_string(HTML)
 
+@app.route("/api/heartbeat", methods=["POST"])
+def heartbeat():
+    global latest_status, last_heartbeat
+
+    if not HEARTBEAT_TOKEN:
+        return jsonify({"error": "Heartbeat token not configured"}), 503
+
+    auth = request.headers.get("Authorization", "")
+
+    if not secrets.compare_digest(
+        auth, f"Bearer {HEARTBEAT_TOKEN}"
+    ):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+
+    connected = data.get("connected")
+
+    if not isinstance(connected, bool):
+        return jsonify({"error": "Invalid connection status"}), 400
+
+    try:
+        latency = max(0, float(data.get("latency", 0)))
+        packet_loss = min(100, max(0, float(data.get("packet_loss", 100))))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid metrics"}), 400
+
+    latest_status = {
+        "connected": connected,
+        "latency": round(latency, 3),
+        "packet_loss": round(packet_loss, 1)
+    }
+
+    last_heartbeat = time.time()
+
+    return jsonify({"ok": True})
+
+
 @app.route("/api/status")
 def status():
-
-    global demo_failure
-
     if demo_failure:
-
         return jsonify({
-            "connected":False,
-            "latency":0,
-            "packet_loss":100
+            "connected": False,
+            "latency": 0,
+            "packet_loss": 100
         })
 
-    result=subprocess.run(
-        ["ping","-c","1","-W","1",VM2_IP],
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode==0:
-
-        match=re.search(
-            r"time[=<]([0-9.]+)",
-            result.stdout
-        )
-
-        latency=float(match.group(1)) if match else 0
-
+    if time.time() - last_heartbeat > 15:
         return jsonify({
-            "connected":True,
-            "latency":round(latency,3),
-            "packet_loss":0
+            "connected": False,
+            "latency": 0,
+            "packet_loss": 100
         })
 
-    return jsonify({
-        "connected":False,
-        "latency":0,
-        "packet_loss":100
-    })
+    return jsonify(latest_status)
 
-@app.route("/api/demo",methods=["POST"])
+
+@app.route("/api/demo", methods=["POST"])
 def demo():
-
     global demo_failure
 
-    data=request.get_json(silent=True) or {}
+    data = request.get_json(silent=True) or {}
+    demo_failure = bool(data.get("failure", False))
 
-    demo_failure=bool(data.get("failure",False))
+    return jsonify({"ok": True})
 
-    return jsonify({"ok":True})
 
-if __name__=="__main__":
-
+if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=5000,
